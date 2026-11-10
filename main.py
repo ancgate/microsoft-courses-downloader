@@ -1,6 +1,7 @@
 """
-Script to extract learning path links from a Microsoft Learn course page.
-Uses the Microsoft Learn Catalog API.
+Download Microsoft Learn courses, learning paths, modules, and collections
+as combined HTML and PDF files (one file per module).
+Uses the Microsoft Learn Catalog API and the Collections (lists) API.
 """
 
 import os
@@ -12,6 +13,8 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # =============================================================================
@@ -21,10 +24,17 @@ from playwright.async_api import async_playwright
 DEFAULT_COURSE_URL = "https://learn.microsoft.com/en-us/training/courses/ai-103t00"
 DEFAULT_LEARNING_PATH_URL = "https://learn.microsoft.com/en-us/training/paths/develop-generative-ai-apps"
 DEFAULT_MODULE_URL = "https://learn.microsoft.com/en-us/training/modules/prepare-azure-ai-development"
+DEFAULT_COLLECTION_URL = "https://learn.microsoft.com/en-us/collections/p3zwhztxryzkqz"
 CATALOG_API_URL = "https://learn.microsoft.com/api/catalog/"
+COLLECTION_API_URL = "https://learn.microsoft.com/api/lists/"
+# Folder name for collection items that are not inside any section
+UNSECTIONED_ITEMS_NAME = "Other items"
 OUTPUT_BASE_DIR = "output"
 REQUEST_TIMEOUT = 30
 CATALOG_TIMEOUT = 60
+# Retries for dropped connections and temporary server errors (429, 5xx)
+REQUEST_RETRIES = 4
+RETRY_BACKOFF = 2  # seconds; doubles after each failed attempt
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"
@@ -76,6 +86,11 @@ def is_module_url(url: str) -> bool:
     return "/modules/" in url
 
 
+def is_collection_url(url: str) -> bool:
+    """Check if a URL is a Microsoft Learn collection URL."""
+    return "/collections/" in url
+
+
 def clean_url(url: str) -> str:
     """Remove query parameters from a URL."""
     parsed = urlparse(url)
@@ -96,6 +111,32 @@ class PageContent:
     url: str
 
 
+@dataclass
+class CollectionItem:
+    """A single entry (learning path, module, course, ...) in a collection."""
+
+    title: str
+    url: str
+
+
+@dataclass
+class CollectionSection:
+    """A named group of items inside a collection."""
+
+    name: str
+    items: list[CollectionItem]
+
+
+@dataclass
+class Collection:
+    """A Microsoft Learn collection and its sections."""
+
+    name: str
+    sections: list[CollectionSection]
+    # Items that are not inside any section
+    unsectioned_items: list[CollectionItem]
+
+
 # =============================================================================
 # HTTP Client
 # =============================================================================
@@ -107,12 +148,22 @@ class HttpClient:
     def __init__(self, headers: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT):
         self.headers = headers or DEFAULT_HEADERS
         self.timeout = timeout
+        retry = Retry(
+            total=REQUEST_RETRIES,
+            backoff_factor=RETRY_BACKOFF,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False,
+        )
+        self.session = requests.Session()
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
 
     def get(self, url: str, **kwargs) -> requests.Response:
         """Make a GET request with default headers and timeout."""
         request_headers = kwargs.pop("headers", self.headers)
         request_timeout = kwargs.pop("timeout", self.timeout)
-        return requests.get(
+        return self.session.get(
             url, headers=request_headers, timeout=request_timeout, **kwargs
         )
 
@@ -228,12 +279,62 @@ class CatalogService:
     def _find_learning_path_by_name(
         path_name: str, learning_paths: list[dict]
     ) -> Optional[dict]:
-        """Find a learning path by its name in the URL."""
+        """Find a learning path whose URL ends with the given name."""
         for lp in learning_paths:
-            lp_url = lp.get("url", "")
-            if path_name in lp_url:
+            lp_url = clean_url(lp.get("url", ""))
+            if CatalogService._extract_id_from_url(lp_url) == path_name:
                 return lp
         return None
+
+
+# =============================================================================
+# Collection Service
+# =============================================================================
+
+
+class CollectionService:
+    """Service for reading Microsoft Learn collections."""
+
+    def __init__(self, http_client: Optional[HttpClient] = None):
+        self.http_client = http_client or HttpClient()
+
+    def fetch(self, collection_url: str) -> Optional[Collection]:
+        """Fetch a collection and its sections from the lists API."""
+        collection_id = collection_url.rstrip("/").split("/")[-1]
+        try:
+            response = self.http_client.get(f"{COLLECTION_API_URL}{collection_id}")
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error fetching collection '{collection_id}': {e}")
+            return None
+
+        sections = [
+            CollectionSection(
+                name=section.get("name") or f"Section {i}",
+                items=self._parse_items(section.get("items", [])),
+            )
+            for i, section in enumerate(data.get("sections") or [], 1)
+        ]
+
+        return Collection(
+            name=data.get("name") or collection_id,
+            sections=sections,
+            unsectioned_items=self._parse_items(data.get("items") or []),
+        )
+
+    @staticmethod
+    def _parse_items(raw_items: list[dict]) -> list[CollectionItem]:
+        """Convert raw API items to CollectionItem objects."""
+        items = []
+        for raw in raw_items:
+            data = raw.get("data") or {}
+            url = data.get("rawUrl") or data.get("url")
+            if not url:
+                continue
+            url = clean_url(urljoin("https://learn.microsoft.com/", url))
+            items.append(CollectionItem(title=data.get("title") or url, url=url))
+        return items
 
 
 # =============================================================================
@@ -529,8 +630,10 @@ class CourseProcessor:
         content_service: Optional[ContentService] = None,
         html_generator: Optional[HtmlGenerator] = None,
         pdf_generator: Optional[PdfGenerator] = None,
+        collection_service: Optional[CollectionService] = None,
     ):
         self.catalog_service = catalog_service or CatalogService()
+        self.collection_service = collection_service or CollectionService()
         self.content_service = content_service or ContentService()
         self.html_generator = html_generator or HtmlGenerator(self.content_service)
         self.pdf_generator = pdf_generator or PdfGenerator()
@@ -626,6 +729,114 @@ class CourseProcessor:
         print(f"\n{'=' * 80}")
         print(f"All done! Output is in '{module_output_dir}/'")
 
+    def process_collection(
+        self, collection_url: str, output_base: str = OUTPUT_BASE_DIR
+    ) -> list[str]:
+        """Process a collection, keeping each section in its own folder."""
+        print(f"\nFetching collection: {collection_url}")
+        print("=" * 80)
+
+        collection = self.collection_service.fetch(collection_url)
+        if not collection:
+            return []
+
+        # Unsectioned items go in their own folder only when the collection
+        # also has sections; otherwise they sit directly in the collection folder.
+        groups = list(collection.sections)
+        if collection.unsectioned_items and groups:
+            groups.insert(
+                0, CollectionSection(UNSECTIONED_ITEMS_NAME, collection.unsectioned_items)
+            )
+
+        item_count = len(collection.unsectioned_items) + sum(
+            len(s.items) for s in collection.sections
+        )
+        if item_count == 0:
+            print("\nThis collection is empty.")
+            return []
+
+        if not self.catalog_service.catalog:
+            print("Failed to fetch catalog.")
+            return []
+
+        collection_dir = os.path.join(
+            output_base, self._sanitize_dir_name(collection.name)
+        )
+        os.makedirs(collection_dir, exist_ok=True)
+        print(f"\n  Collection: {collection.name}")
+        print(f"  Output directory: {collection_dir}/")
+
+        processed = []
+        if groups:
+            for i, section in enumerate(groups, 1):
+                section_dir = os.path.join(
+                    collection_dir, f"{i:02d}-{self._sanitize_dir_name(section.name)}"
+                )
+                os.makedirs(section_dir, exist_ok=True)
+                print(f"\n{'-' * 80}")
+                print(f"Section {i}: {section.name} ({len(section.items)} item(s))")
+                print(f"  Created: {section_dir}/")
+                processed += self._process_collection_items(section.items, section_dir)
+        else:
+            processed = self._process_collection_items(
+                collection.unsectioned_items, collection_dir
+            )
+
+        print(f"\n{'=' * 80}")
+        print(f"All done! Output is in '{collection_dir}/'")
+
+        return processed
+
+    def _process_collection_items(
+        self, items: list[CollectionItem], output_dir: str
+    ) -> list[str]:
+        """Download each supported item, numbered in collection order."""
+        processed = []
+        index = 0
+        for item in items:
+            kind = self._training_kind(item.url)
+            if kind is None:
+                print(f"\n  Skipping (not a course, learning path or module): {item.title}")
+                print(f"    {item.url}")
+                continue
+
+            index += 1
+            if kind == "paths":
+                self._process_learning_path(item.url, index, output_dir)
+            elif kind == "modules":
+                self._process_module(item.url, index, output_dir)
+            else:
+                self._process_course_item(item, index, output_dir)
+            processed.append(item.url)
+        return processed
+
+    def _process_course_item(
+        self, item: CollectionItem, index: int, output_dir: str
+    ) -> None:
+        """Process a course found inside a collection."""
+        course_dir = os.path.join(
+            output_dir, f"{index:02d}-{self._sanitize_dir_name(item.title)}"
+        )
+        os.makedirs(course_dir, exist_ok=True)
+        print(f"\nCourse: {item.title}")
+        print(f"  Created: {course_dir}/")
+
+        paths = self.catalog_service.get_course_learning_paths(item.url)
+        if not paths:
+            print("    (No learning paths found for this course)")
+        for i, path_url in enumerate(paths, 1):
+            self._process_learning_path(path_url, i, course_dir)
+
+    @staticmethod
+    def _training_kind(url: str) -> Optional[str]:
+        """Return 'courses', 'paths' or 'modules' for a training URL, else None.
+
+        Only the top page of a course, path or module matches, so single
+        unit pages and other content (docs, videos, ...) are skipped.
+        """
+        match = re.search(r"/training/(courses|paths|modules)/[^/]+/?$", url)
+        return match.group(1) if match else None
+
     def _fetch_course_title(self, course_url: str) -> str:
         """Fetch the course page and extract the h1 title."""
         try:
@@ -711,13 +922,15 @@ def get_url_from_user(
     default_course_url: str = DEFAULT_COURSE_URL,
     default_learning_path_url: str = DEFAULT_LEARNING_PATH_URL,
     default_module_url: str = DEFAULT_MODULE_URL,
+    default_collection_url: str = DEFAULT_COLLECTION_URL,
 ) -> str:
-    """Prompt user for a Microsoft Learn URL (course, learning path, or module)."""
+    """Prompt user for a Microsoft Learn URL (course, path, module, or collection)."""
     print(
-        f"Enter a Microsoft Learn course, learning path, or module URL"
+        f"Enter a Microsoft Learn course, learning path, module, or collection URL"
         f"\n Course URL example: {default_course_url}"
         f"\n Learning path URL example: {default_learning_path_url}"
         f"\n Module URL example: {default_module_url}"
+        f"\n Collection URL example: {default_collection_url}"
         f"\n  (press Enter to use default course URL: {default_course_url}):"
     )
     url = input("> ").strip()
@@ -735,7 +948,9 @@ def main() -> list[str]:
     url = get_url_from_user()
     processor = CourseProcessor()
 
-    if is_course_url(url):
+    if is_collection_url(url):
+        return processor.process_collection(url)
+    elif is_course_url(url):
         return processor.process_course(url)
     elif is_learning_path_url(url):
         return processor.process_learning_path(url)
@@ -746,7 +961,8 @@ def main() -> list[str]:
         print(
             "Unrecognized URL type. Please provide a Microsoft Learn course URL\n"
             "  (containing '/courses/'), learning path URL (containing '/paths/'),\n"
-            "  or module URL (containing '/modules/')."
+            "  module URL (containing '/modules/'), or collection URL\n"
+            "  (containing '/collections/')."
         )
         return []
 
