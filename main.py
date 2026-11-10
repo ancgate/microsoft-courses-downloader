@@ -13,6 +13,8 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # =============================================================================
@@ -30,6 +32,9 @@ UNSECTIONED_ITEMS_NAME = "Other items"
 OUTPUT_BASE_DIR = "output"
 REQUEST_TIMEOUT = 30
 CATALOG_TIMEOUT = 60
+# Retries for dropped connections and temporary server errors (429, 5xx)
+REQUEST_RETRIES = 4
+RETRY_BACKOFF = 2  # seconds; doubles after each failed attempt
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"
@@ -143,12 +148,22 @@ class HttpClient:
     def __init__(self, headers: Optional[dict] = None, timeout: int = REQUEST_TIMEOUT):
         self.headers = headers or DEFAULT_HEADERS
         self.timeout = timeout
+        retry = Retry(
+            total=REQUEST_RETRIES,
+            backoff_factor=RETRY_BACKOFF,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False,
+        )
+        self.session = requests.Session()
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
 
     def get(self, url: str, **kwargs) -> requests.Response:
         """Make a GET request with default headers and timeout."""
         request_headers = kwargs.pop("headers", self.headers)
         request_timeout = kwargs.pop("timeout", self.timeout)
-        return requests.get(
+        return self.session.get(
             url, headers=request_headers, timeout=request_timeout, **kwargs
         )
 
